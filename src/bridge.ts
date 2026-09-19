@@ -1,6 +1,6 @@
 /**
  * Client for the optional live bridge: a tiny WebSocket server that the
- * companion Godot EditorPlugin (see editor-plugin/godot_mcp_bridge.gd)
+ * companion Godot EditorPlugin (see sample-project/addons/godot_mcp_bridge/)
  * opens while the Godot editor is running. When it's not running, every
  * call here fails fast with a clear message instead of hanging.
  */
@@ -48,6 +48,11 @@ export async function callBridge(req: BridgeRequest): Promise<BridgeResponse> {
             `file-based tools (create_scene, write_script, etc.) don't need it.`
         )
       );
+    });
+
+    ws.on("close", () => {
+      clearTimeout(timeout);
+      reject(new Error(`The Godot editor bridge at ${url} closed the connection before replying.`));
     });
 
     ws.on("open", () => {

@@ -1,0 +1,2 @@
+# Godot text files use LF everywhere (matches what the editor writes)
+* text=auto eol=lf

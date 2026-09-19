@@ -37,14 +37,32 @@ function errText(e: unknown) {
   };
 }
 
-async function resolveInProject(projectPath: string, relOrAbs: string): Promise<string> {
-  const full = path.isAbsolute(relOrAbs) ? relOrAbs : path.join(projectPath, relOrAbs);
-  const normalizedProject = path.resolve(projectPath);
-  const normalizedFull = path.resolve(full);
-  if (!normalizedFull.startsWith(normalizedProject)) {
-    throw new Error(`Refusing to write outside the project folder: ${relOrAbs}`);
+/** Fails unless `projectPath` is a Godot project folder (contains project.godot). */
+async function assertProject(projectPath: string): Promise<void> {
+  const isProject = await fs
+    .stat(path.join(projectPath, "project.godot"))
+    .then((s) => s.isFile())
+    .catch(() => false);
+  if (!isProject) {
+    throw new Error(`No project.godot found in "${projectPath}" — project_path must be the Godot project folder`);
   }
-  return normalizedFull;
+}
+
+/** Resolves a project-relative, absolute, or res:// path, refusing anything outside the project. */
+async function resolveInProject(projectPath: string, relOrAbs: string): Promise<string> {
+  await assertProject(projectPath);
+  const root = path.resolve(projectPath);
+  const full = path.resolve(root, relOrAbs.startsWith("res://") ? relOrAbs.slice("res://".length) : relOrAbs);
+  const rel = path.relative(root, full);
+  if (rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel)) {
+    throw new Error(`Refusing to access a path outside the project folder: ${relOrAbs}`);
+  }
+  return full;
+}
+
+/** res:// path for a file inside the project (always forward slashes, even on Windows). */
+function toResPath(projectPath: string, fullPath: string): string {
+  return `res://${path.relative(path.resolve(projectPath), fullPath).split(path.sep).join("/")}`;
 }
 
 async function findGodotBinary(): Promise<string> {
@@ -61,27 +79,27 @@ server.tool(
   { project_path: z.string().describe("Absolute path to the Godot project folder (containing project.godot)") },
   async ({ project_path }) => {
     try {
-      const exts = new Set([".tscn", ".gd", ".tres", ".res", ".import"]);
-      const results: Record<string, string[]> = { scenes: [], scripts: [], resources: [], other: [] };
+      await assertProject(project_path);
+      const results: Record<string, string[]> = { scenes: [], scripts: [], resources: [] };
+      const skipDirs = new Set([".godot", ".git", "node_modules"]);
 
       async function walk(dir: string) {
         const entries = await fs.readdir(dir, { withFileTypes: true });
         for (const entry of entries) {
-          if (entry.name === "." || entry.name === ".." || entry.name === ".godot") continue;
           const full = path.join(dir, entry.name);
           if (entry.isDirectory()) {
-            await walk(full);
+            if (!skipDirs.has(entry.name)) await walk(full);
           } else {
-            const rel = path.relative(project_path, full);
+            const rel = path.relative(project_path, full).split(path.sep).join("/");
             const ext = path.extname(entry.name);
             if (ext === ".tscn") results.scenes.push(rel);
             else if (ext === ".gd") results.scripts.push(rel);
             else if (ext === ".tres" || ext === ".res") results.resources.push(rel);
-            else if (exts.has(ext)) continue;
           }
         }
       }
       await walk(project_path);
+      for (const list of Object.values(results)) list.sort();
       return text(JSON.stringify(results, null, 2));
     } catch (e) {
       return errText(e);
@@ -162,10 +180,8 @@ server.tool(
 
       let scriptExtResourceId: string | undefined;
       if (script_path) {
-        const resPath = script_path.startsWith("res://")
-          ? script_path
-          : `res://${path.relative(project_path, await resolveInProject(project_path, script_path))}`;
-        scriptExtResourceId = addExtResource(file, "Script", resPath);
+        const scriptFull = await resolveInProject(project_path, script_path);
+        scriptExtResourceId = addExtResource(file, "Script", toResPath(project_path, scriptFull));
       }
 
       addNode(file, { name, type, parentPath: parent_path, properties, scriptExtResourceId });
@@ -273,7 +289,8 @@ server.tool(
       const count = content.split(old_text).length - 1;
       if (count === 0) throw new Error("old_text not found in file");
       if (count > 1) throw new Error(`old_text matched ${count} times; make it unique`);
-      const updated = content.replace(old_text, new_text);
+      // replacer function: a string would have `$&`, `$1`, ... interpreted
+      const updated = content.replace(old_text, () => new_text);
       await fs.writeFile(full, updated, "utf-8");
       return text(`Edited ${script_path}.`);
     } catch (e) {
@@ -292,6 +309,7 @@ server.tool(
   },
   async ({ project_path, scene_path, timeout_ms }) => {
     try {
+      await assertProject(project_path);
       const godot = await findGodotBinary();
       const args = ["--headless", "--path", project_path];
       if (scene_path) args.push(scene_path);
@@ -304,9 +322,12 @@ server.tool(
         child.on("error", (err) =>
           reject(new Error(`Could not launch "${godot}": ${err.message}. Set GODOT_BIN to the Godot 4 executable path.`))
         );
-        child.on("close", () => resolve(out));
+        child.on("close", (code, signal) => {
+          const status = signal ? `stopped by ${signal} after the ${timeout_ms}ms timeout` : `exit code ${code}`;
+          resolve(`${out}${out && !out.endsWith("\n") ? "\n" : ""}[${status}]`);
+        });
       });
-      return text(output || "(no output — process ran and exited cleanly)");
+      return text(output);
     } catch (e) {
       return errText(e);
     }
