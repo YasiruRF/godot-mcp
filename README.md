@@ -11,6 +11,10 @@ optionally drive a *running* Godot editor over a local WebSocket bridge.
   editor. They let Claude edit the open scene *inside* the editor — you watch
   each node appear, and Ctrl+Z undoes it — and play/stop scenes.
 
+[![godot-mcp: how it works today — click to watch the 23-second demo](public/godot-mcp-poster.jpg)](public/godot-mcp.mp4)
+
+*New to Godot? Click the picture for a 23-second look at how godot-mcp works today.*
+
 ```
 godot-mcp/
 ├── src/                  # the MCP server (TypeScript)
@@ -19,10 +23,14 @@ godot-mcp/
 │   └── bridge.ts         # WebSocket client for the live editor bridge
 ├── sample-project/       # a working Godot 4 project to try the tools on
 │   ├── scenes/Main.tscn
-│   ├── scripts/player.gd
+│   ├── scripts/          # player.gd (the ball), camera_rig.gd, game.gd
 │   └── addons/godot_mcp_bridge/   # the live-bridge EditorPlugin
 └── test/                 # `npm test`
 ```
+
+The sample project is a small 3D game: roll a ball (WASD or arrow keys, Space to
+jump, mouse or Q/E to orbit the third-person camera) over ramps, past boxes and
+crates, to the glowing goal pad. R restarts.
 
 ## Contents
 
@@ -97,20 +105,20 @@ To try things out without risking your own work, use the bundled
 ### 2. Build and edit scenes
 
 Scenes are addressed by **node path**: `.` is the scene root, `Player` is a
-child of the root, `Player/Sprite2D` is a child of `Player`.
+child of the root, `Player/Ball` is a child of `Player`.
 
 Example conversation:
 
-> **You:** In `scenes/Main.tscn`, add an `Area2D` called `Coin` under the root
-> with a `CollisionShape2D` child, and put the coin at (400, 260).
+> **You:** In `scenes/Main.tscn`, add an `Area3D` called `Coin` under the root
+> with a `CollisionShape3D` child, and put the coin at (2, 1, -10).
 
 Claude will call, in order:
 
 | Call | Arguments |
 |---|---|
-| `add_node` | `scene_path: "scenes/Main.tscn"`, `parent_path: "."`, `name: "Coin"`, `type: "Area2D"` |
-| `add_node` | `parent_path: "Coin"`, `name: "CollisionShape2D"`, `type: "CollisionShape2D"` |
-| `set_node_properties` | `node_path: "Coin"`, `properties: { "position": "Vector2(400, 260)" }` |
+| `add_node` | `scene_path: "scenes/Main.tscn"`, `parent_path: "."`, `name: "Coin"`, `type: "Area3D"` |
+| `add_node` | `parent_path: "Coin"`, `name: "CollisionShape3D"`, `type: "CollisionShape3D"` |
+| `set_node_properties` | `node_path: "Coin"`, `properties: { "position": "Vector3(2, 1, -10)" }` |
 
 Property values are **raw Godot text**, exactly as they appear in a `.tscn`
 file: `Vector2(10, 20)`, `Color(1, 0, 0, 1)`, `false`, `"a string"` (with the
@@ -178,18 +186,18 @@ toggle it off and on (or reopen the project) so Godot loads the new version.
 
 **A live session**
 
-> **You:** Open `scenes/Main.tscn` in the editor and add a platform: a
-> `StaticBody2D` at (650, 380) with a 100×20 collision shape and a brown
-> `ColorRect` as its visual.
+> **You:** Open `scenes/Main.tscn` in the editor and add a crate: a
+> `StaticBody3D` at (3, 1, -20) with a 2×2×2 box collision shape and a brown
+> box mesh as its visual.
 
 Claude calls, and you watch the nodes appear one by one:
 
 | Call | Arguments |
 |---|---|
 | `editor_open_scene` | `scene_path: "scenes/Main.tscn"` |
-| `editor_add_node` | `parent_path: "."`, `name: "Platform"`, `type: "StaticBody2D"`, `properties: { "position": "Vector2(650, 380)" }` |
-| `editor_add_node` | `parent_path: "Platform"`, `name: "CollisionShape2D"`, `type: "CollisionShape2D"`, `properties: { "shape": "RectangleShape2D.new()", "shape:size": "Vector2(100, 20)" }` |
-| `editor_add_node` | `parent_path: "Platform"`, `name: "Visual"`, `type: "ColorRect"`, `properties: { "color": "Color(0.6, 0.4, 0.2, 1)", "size": "Vector2(100, 20)" }` |
+| `editor_add_node` | `parent_path: "."`, `name: "Crate"`, `type: "StaticBody3D"`, `properties: { "position": "Vector3(3, 1, -20)" }` |
+| `editor_add_node` | `parent_path: "Crate"`, `name: "CollisionShape3D"`, `type: "CollisionShape3D"`, `properties: { "shape": "BoxShape3D.new()", "shape:size": "Vector3(2, 2, 2)" }` |
+| `editor_add_node` | `parent_path: "Crate"`, `name: "Mesh"`, `type: "MeshInstance3D"`, `properties: { "mesh": "BoxMesh.new()", "mesh:size": "Vector3(2, 2, 2)", "material_override": "StandardMaterial3D.new()", "material_override:albedo_color": "Color(0.6, 0.4, 0.2, 1)" }` |
 
 Not happy with it? **Ctrl+Z**. Happy? Save with Ctrl+S, or ask *"save it"*
 (`editor_save_scene`). Then *"run it"* (`editor_run_scene`) to play the scene.
