@@ -65,7 +65,11 @@ test("file tools: list, read, create, add, edit, remove", async () => {
     assert.ok(listing.scripts.includes("scripts/player.gd"));
 
     const tree = JSON.parse((await call("read_scene", { project_path: proj, scene_path: "scenes/Main.tscn" })).text);
-    assert.deepEqual(tree.map((n) => n.path), [".", "Player", "Player/CollisionShape2D", "Floor", "Floor/CollisionShape2D"]);
+    const paths = tree.map((n) => n.path);
+    for (const expected of [".", "Player", "Player/CollisionShape3D", "Floor", "Goal", "CameraRig/Pivot/SpringArm3D/Camera3D", "HUD/Label"]) {
+      assert.ok(paths.includes(expected), `sample scene should contain ${expected}`);
+    }
+    assert.equal(tree.find((n) => n.path === "Player").type, "RigidBody3D");
 
     assert.equal((await call("create_scene", { project_path: proj, scene_path: "scenes/Coin.tscn", root_name: "Coin", root_type: "Area2D" })).isError, false);
     assert.equal((await call("create_scene", { project_path: proj, scene_path: "scenes/Coin.tscn", root_name: "Coin", root_type: "Area2D" })).isError, true);
@@ -274,15 +278,15 @@ test("file tools reject GDScript-only values like RectangleShape2D.new() instead
     const scenePath = path.join(proj, "scenes/Main.tscn");
     const before = fs.readFileSync(scenePath, "utf8");
     const add = await call("add_node", {
-      project_path: proj, scene_path: "scenes/Main.tscn", parent_path: ".", name: "Shape", type: "CollisionShape2D",
-      properties: { shape: "RectangleShape2D.new()" },
+      project_path: proj, scene_path: "scenes/Main.tscn", parent_path: ".", name: "Shape", type: "CollisionShape3D",
+      properties: { shape: "BoxShape3D.new()" },
     });
     assert.equal(add.isError, true);
     assert.match(add.text, /GDScript, not scene-file syntax/);
     assert.match(add.text, /editor_add_node/);
 
     const set = await call("set_node_properties", {
-      project_path: proj, scene_path: "scenes/Main.tscn", node_path: "Player/CollisionShape2D", properties: { shape: "CircleShape2D.new()" },
+      project_path: proj, scene_path: "scenes/Main.tscn", node_path: "Player/CollisionShape3D", properties: { shape: "SphereShape3D.new()" },
     });
     assert.equal(set.isError, true);
     assert.equal(fs.readFileSync(scenePath, "utf8"), before);
