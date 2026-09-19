@@ -5,9 +5,11 @@ client) work on **Godot 4** projects: it edits `.tscn` scenes and `.gd` scripts
 directly on disk, runs the project headlessly to catch errors, and can
 optionally drive a *running* Godot editor over a local WebSocket bridge.
 
-- **File tools** need no Godot install and no setup beyond building the server.
-- **Live-editor tools** (play/stop a scene, read the selection) need the small
-  companion plugin enabled in an open editor.
+- **File tools** edit scenes and scripts on disk. They need no Godot install and
+  no setup beyond building the server.
+- **Live-editor tools** need the small companion plugin enabled in an open
+  editor. They let Claude edit the open scene *inside* the editor — you watch
+  each node appear, and Ctrl+Z undoes it — and play/stop scenes.
 
 ```
 godot-mcp/
@@ -122,9 +124,13 @@ scene for you.
 To start a scene from scratch, use `create_scene` first (it won't overwrite an
 existing file unless you pass `overwrite: true`), then `add_node`.
 
-> Godot's editor keeps scenes in memory. If a scene is open in the editor while
-> Claude edits it on disk, Godot will offer to reload it — accept, and don't
-> save the stale version over the top.
+> **Editor open?** Godot keeps its own in-memory copy of an open scene, so
+> editing the file on disk underneath it makes the two diverge (and whichever
+> is saved last wins). When the bridge plugin is running, these on-disk tools
+> therefore **refuse to edit a scene that is open in the editor** and point you
+> to the [live-editing tools](#5-live-editing-watch-claude-work-in-the-editor)
+> (or to closing the scene's tab first). Without the plugin they can't tell, so
+> save and close the scene in Godot before asking Claude to edit it on disk.
 
 ### 3. Read and edit scripts
 
@@ -149,26 +155,61 @@ tell me if there are errors."*
 It needs a Godot 4 executable. If it isn't on your `PATH` as `godot4`, set
 `GODOT_BIN` (see [Configuration](#configuration)).
 
-### 5. (Optional) Drive the live editor
+### 5. Live editing: watch Claude work in the editor
 
-The `editor_*` tools talk to a running Godot editor through a tiny plugin.
+With the bridge plugin enabled, Claude can edit the scene **inside the running
+Godot editor** instead of on disk. Each edit appears immediately in the Scene
+dock and the viewport, the affected node is selected, and every edit is a step
+in Godot's undo history — press **Ctrl+Z** to take it back. Nothing is written
+to disk until the scene is saved (Ctrl+S, or Claude's `editor_save_scene`).
+
+**Set up the plugin (once per project)**
 
 1. Copy `sample-project/addons/godot_mcp_bridge/` into your project's `addons/`
-   folder (or just open `sample-project/` in Godot).
+   folder (or just open `sample-project/` in Godot, where it's already enabled).
 2. In Godot: **Project → Project Settings → Plugins → enable "Godot MCP Bridge"**.
 3. The Output panel should print
    `godot_mcp_bridge: listening on ws://127.0.0.1:9080`.
-4. Ask Claude to `editor_ping`. A reply of `{"ok":true,"result":{"status":"alive",...}}`
-   means the bridge is up.
+4. Ask Claude to `editor_ping`. A reply like `{"status": "alive", ...}` means the
+   bridge is up.
 
-From then on Claude can start and stop scenes (`editor_run_scene` with a
-`res://` path, `editor_stop`) and see what you have selected in the editor
-(`editor_get_selection`) — e.g. *"Run Main.tscn, and tell me which node I have
-selected."*
+After updating the server, also refresh the plugin copy in your project and
+toggle it off and on (or reopen the project) so Godot loads the new version.
 
-The bridge needs a recent Godot 4 (it uses the `EditorInterface` singleton and
-`WebSocketPeer.accept_stream`; **Godot 4.2 or newer** is recommended). The
-sample project targets 4.3.
+**A live session**
+
+> **You:** Open `scenes/Main.tscn` in the editor and add a platform: a
+> `StaticBody2D` at (650, 380) with a 100×20 collision shape and a brown
+> `ColorRect` as its visual.
+
+Claude calls, and you watch the nodes appear one by one:
+
+| Call | Arguments |
+|---|---|
+| `editor_open_scene` | `scene_path: "scenes/Main.tscn"` |
+| `editor_add_node` | `parent_path: "."`, `name: "Platform"`, `type: "StaticBody2D"`, `properties: { "position": "Vector2(650, 380)" }` |
+| `editor_add_node` | `parent_path: "Platform"`, `name: "CollisionShape2D"`, `type: "CollisionShape2D"`, `properties: { "shape": "RectangleShape2D.new()", "shape:size": "Vector2(100, 20)" }` |
+| `editor_add_node` | `parent_path: "Platform"`, `name: "Visual"`, `type: "ColorRect"`, `properties: { "color": "Color(0.6, 0.4, 0.2, 1)", "size": "Vector2(100, 20)" }` |
+
+Not happy with it? **Ctrl+Z**. Happy? Save with Ctrl+S, or ask *"save it"*
+(`editor_save_scene`). Then *"run it"* (`editor_run_scene`) to play the scene.
+Claude can also read what's open (`editor_get_scene_tree`) and what you have
+selected (`editor_get_selection` — *"which node do I have selected?"*).
+
+Property values use **Godot syntax**: `Vector2(1, 2)`, `Color(1, 0, 0, 1)` (all
+four components), `true`, `42`, and text **with its quotes**
+(`"\"Hello\""`). For a resource property such as a collision `shape`,
+`ClassName.new()` creates a fresh resource and `"shape:size"` sets a property
+inside it (properties are applied in order, so set `shape` first). If any value
+in a call is invalid, the whole call is rejected and nothing is changed.
+
+Live edits act on the scene in the editor's **active tab** — use
+`editor_open_scene` to switch. They work on nodes that belong to that scene
+(not the internals of instanced sub-scenes).
+
+The bridge is tested against **Godot 4.7.2**; it needs the `EditorInterface`
+singleton and `WebSocketPeer.accept_stream`, so Godot 4.2 or newer is the
+likely minimum. The sample project targets 4.3.
 
 ## Tool reference
 
@@ -194,10 +235,20 @@ plain class names such as `Sprite2D` (both are Godot rules).
 
 | Tool | Arguments | Purpose |
 |---|---|---|
-| `editor_ping` | — | Checks the bridge is reachable |
+| `editor_ping` | — | Checks the bridge is reachable (returns the Godot version) |
+| `editor_get_scene_tree` | — | Returns the scene open in the editor as a node tree, plus the list of open scenes |
+| `editor_open_scene` | `scene_path` | Opens a scene in the editor (switches to its tab) |
+| `editor_add_node` | `parent_path`, `name`, `type`, `properties?`, `script_path?`, `scene_path?` | Adds a node to the open scene — live, selected, undoable |
+| `editor_set_properties` | `node_path`, `properties`, `scene_path?` | Sets properties on a node in the open scene — live, undoable |
+| `editor_remove_node` | `node_path`, `scene_path?` | Removes a node and its descendants from the open scene — live, undoable |
+| `editor_save_scene` | — | Saves the open scene to disk (like Ctrl+S) |
 | `editor_run_scene` | `scene_path` (`res://...`) | Presses "Play Scene" on that scene |
 | `editor_stop` | — | Stops the running scene |
 | `editor_get_selection` | — | Returns the node path(s) currently selected in the editor |
+
+`scene_path` on the live-edit tools is an optional safety check: the call fails
+unless that is the scene currently open. Values use Godot syntax (see
+[Live editing](#5-live-editing-watch-claude-work-in-the-editor)).
 
 ## Configuration
 
@@ -239,6 +290,11 @@ change it there, change `GODOT_MCP_BRIDGE_URL` to match.
 | Plugin logs `failed to listen on 127.0.0.1:9080` | Another Godot editor (or program) already holds the port — close it |
 | `old_text matched N times; make it unique` | Add more surrounding lines to `old_text` in `edit_script` |
 | Edits don't show in the open editor | Godot caches open scenes; accept its "reload from disk" prompt |
+| `... is open in the Godot editor, so editing the file on disk would desync it` | Deliberate guard. Use `editor_add_node` / `editor_set_properties` / `editor_remove_node`, or close that scene's tab in Godot first |
+| `'...' is not the scene currently being edited` | Live edits act on the editor's active tab. Call `editor_open_scene` first |
+| `could not parse '...' as a Godot value` | Use Godot syntax: `Vector2(1, 2)`, `Color(1, 0, 0, 1)` (4 components), `true`, `42`, and text with quotes |
+| `... is GDScript, not scene-file syntax` | `RectangleShape2D.new()` only works in live edits (`editor_add_node`). In a scene file on disk, a resource must be a `SubResource(...)` |
+| `unknown command: add_node` (or another new command) | Your project has an older copy of the plugin. Re-copy `addons/godot_mcp_bridge/` and toggle the plugin off and on |
 | Claude can't see the tools | Check the path in your MCP config is absolute and points at `dist/index.js`, that you ran `npm run build`, and restart the client |
 
 ## How it works
@@ -256,7 +312,10 @@ project splits into two independent halves:
   (`sample-project/addons/godot_mcp_bridge/`) runs inside the Godot editor and
   opens `ws://127.0.0.1:9080`. The `editor_*` tools connect to it, send one JSON
   command (`{"id", "command", "args"}`) and read one JSON reply
-  (`{"id", "ok", "result", "error"}`).
+  (`{"id", "ok", "result", "error"}`). Scene edits go through the editor's
+  `EditorUndoRedoManager` on the scene that is actually open, which is why they
+  show up live and can be undone. The on-disk tools ask the bridge whether a
+  scene is open before touching its file, and refuse if it is.
 
 ## Known limitations
 
@@ -269,11 +328,19 @@ project splits into two independent halves:
   database — run `run_headless` after edits.
 - `run_headless` and the live bridge need a local Godot install; the other
   tools don't.
-- The live bridge has no authentication. It binds to `127.0.0.1` only, so it's
-  local to your machine — don't expose that port on a shared or public host.
-- The live bridge (the GDScript plugin) and `run_headless` are exercised in
-  the test suite only against stand-ins (a mock WebSocket server and a fake
-  binary), not against a real Godot editor.
+- The live bridge has no authentication. It binds to `127.0.0.1` only, but any
+  local program — and potentially a web page in your browser, since browsers
+  allow WebSocket connections to localhost — can send it commands while the
+  plugin is enabled. Those commands can change (undoably) and save the open
+  scene. Enable the plugin while you use it, and never expose the port on a
+  shared or public host.
+- Live edits act on the scene in the active editor tab, on nodes that belong
+  to it (not the internals of instanced sub-scenes). There is no MCP-side undo;
+  use Ctrl+Z in the editor.
+- Tested against Godot 4.7.2: the bridge plugin was run end to end in a real
+  (headless) Godot editor, and `run_headless` with the real binary. Those runs
+  are manual, not part of `npm test`, which uses stand-ins (a mock WebSocket
+  server and a fake binary). Older Godot 4 versions are untested.
 
 ## Development
 

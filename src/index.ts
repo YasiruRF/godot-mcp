@@ -15,11 +15,11 @@ import {
   addExtResource,
   createEmptyScene,
 } from "./tscn.js";
-import { callBridge } from "./bridge.js";
+import { callBridge, type BridgeRequest } from "./bridge.js";
 
 const server = new McpServer({
   name: "godot-mcp",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
 // ---------------------------------------------------------------------------
@@ -67,6 +67,48 @@ function toResPath(projectPath: string, fullPath: string): string {
 
 async function findGodotBinary(): Promise<string> {
   return process.env.GODOT_BIN ?? "godot4";
+}
+
+/** GDScript-only syntax such as `RectangleShape2D.new()` would corrupt a .tscn file. */
+function assertSceneFileValues(properties: Record<string, string> | undefined): void {
+  for (const [key, value] of Object.entries(properties ?? {})) {
+    if (/\.new\s*\(/.test(value)) {
+      throw new Error(
+        `Property "${key}": \`${value}\` is GDScript, not scene-file syntax, and would corrupt the .tscn. ` +
+          `Resources in a scene file must be SubResource(...) entries. To create one (e.g. a collision shape), ` +
+          `open the scene in the Godot editor and use editor_add_node / editor_set_properties, which accept "RectangleShape2D.new()".`
+      );
+    }
+  }
+}
+
+/**
+ * Refuses an on-disk edit of a scene that the running Godot editor has open: the editor keeps its
+ * own in-memory copy, so the two would silently diverge and one save would overwrite the other.
+ * If the editor isn't running (or has a different project open) the edit goes ahead.
+ */
+async function assertSceneNotOpenInEditor(projectPath: string, scenePath: string): Promise<void> {
+  let info: { project_path?: string; open?: string[] } | undefined;
+  try {
+    const res = await callBridge({ command: "get_open_scenes" }, 1500);
+    if (!res.ok) return; // bridge plugin predates get_open_scenes
+    info = res.result as typeof info;
+  } catch {
+    return; // editor not running
+  }
+  if (!info?.project_path || !Array.isArray(info.open)) return;
+
+  const norm = (p: string) => (process.platform === "win32" ? path.resolve(p).toLowerCase() : path.resolve(p));
+  if (norm(info.project_path) !== norm(projectPath)) return; // the editor has a different project open
+
+  const resPath = toResPath(projectPath, await resolveInProject(projectPath, scenePath));
+  if (info.open.includes(resPath)) {
+    throw new Error(
+      `${resPath} is open in the Godot editor, so editing the file on disk would desync it from the editor ` +
+        `(and one of the two saves would overwrite the other). Use editor_add_node / editor_set_properties / ` +
+        `editor_remove_node to edit it live in the editor, or close the scene's tab in Godot first.`
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +185,8 @@ server.tool(
       if (!overwrite) {
         const exists = await fs.stat(full).then(() => true).catch(() => false);
         if (exists) throw new Error(`${scene_path} already exists (pass overwrite: true to replace it)`);
+      } else {
+        await assertSceneNotOpenInEditor(project_path, scene_path);
       }
       await fs.mkdir(path.dirname(full), { recursive: true });
       const file = createEmptyScene(root_name, root_type);
@@ -174,7 +218,9 @@ server.tool(
   },
   async ({ project_path, scene_path, parent_path, name, type, properties, script_path }) => {
     try {
+      assertSceneFileValues(properties);
       const full = await resolveInProject(project_path, scene_path);
+      await assertSceneNotOpenInEditor(project_path, scene_path);
       const raw = await fs.readFile(full, "utf-8");
       const file = parseTscn(raw);
 
@@ -204,6 +250,7 @@ server.tool(
   async ({ project_path, scene_path, node_path }) => {
     try {
       const full = await resolveInProject(project_path, scene_path);
+      await assertSceneNotOpenInEditor(project_path, scene_path);
       const raw = await fs.readFile(full, "utf-8");
       const file = parseTscn(raw);
       removeNode(file, node_path);
@@ -226,7 +273,9 @@ server.tool(
   },
   async ({ project_path, scene_path, node_path, properties }) => {
     try {
+      assertSceneFileValues(properties);
       const full = await resolveInProject(project_path, scene_path);
+      await assertSceneNotOpenInEditor(project_path, scene_path);
       const raw = await fs.readFile(full, "utf-8");
       const file = parseTscn(raw);
       setNodeProperties(file, node_path, properties);
@@ -338,60 +387,112 @@ server.tool(
 // Phase 2 — live editor bridge tools (require the companion EditorPlugin)
 // ---------------------------------------------------------------------------
 
+/** Sends one command to the editor bridge; a bridge-reported failure becomes an isError result. */
+async function bridgeTool(req: BridgeRequest) {
+  try {
+    const res = await callBridge(req);
+    if (!res.ok) throw new Error(res.error ?? "the Godot editor bridge reported an error");
+    return text(JSON.stringify(res.result ?? null, null, 2));
+  } catch (e) {
+    return errText(e);
+  }
+}
+
+const sceneGuard = z
+  .string()
+  .optional()
+  .describe("Optional safety check: fail unless this is the scene currently open in the editor");
+
 server.tool(
   "editor_ping",
   "Checks whether the Godot editor is running with the godot_mcp_bridge plugin enabled.",
   {},
-  async () => {
-    try {
-      const res = await callBridge({ command: "ping" });
-      return text(JSON.stringify(res));
-    } catch (e) {
-      return errText(e);
-    }
-  }
+  () => bridgeTool({ command: "ping" })
 );
 
 server.tool(
   "editor_run_scene",
   "Tells the running Godot editor to play a specific scene (like pressing the Play Scene button).",
   { scene_path: z.string().describe('e.g. "res://scenes/Main.tscn"') },
-  async ({ scene_path }) => {
-    try {
-      const res = await callBridge({ command: "run_scene", args: { scene_path } });
-      return text(JSON.stringify(res));
-    } catch (e) {
-      return errText(e);
-    }
-  }
+  ({ scene_path }) => bridgeTool({ command: "run_scene", args: { scene_path } })
 );
 
 server.tool(
   "editor_stop",
   "Tells the running Godot editor to stop the currently playing scene.",
   {},
-  async () => {
-    try {
-      const res = await callBridge({ command: "stop" });
-      return text(JSON.stringify(res));
-    } catch (e) {
-      return errText(e);
-    }
-  }
+  () => bridgeTool({ command: "stop" })
 );
 
 server.tool(
   "editor_get_selection",
   "Returns the currently selected node(s) in the Godot editor.",
   {},
-  async () => {
-    try {
-      const res = await callBridge({ command: "get_selection" });
-      return text(JSON.stringify(res));
-    } catch (e) {
-      return errText(e);
-    }
-  }
+  () => bridgeTool({ command: "get_selection" })
+);
+
+// --- Live editing: these change the scene open in the editor itself, so the user watches each
+// --- edit appear and can undo it with Ctrl+Z. Nothing is written to disk until the scene is saved.
+
+server.tool(
+  "editor_get_scene_tree",
+  "Returns the scene currently open in the Godot editor as a node tree, plus the list of open scenes.",
+  {},
+  () => bridgeTool({ command: "get_scene_tree" })
+);
+
+server.tool(
+  "editor_open_scene",
+  "Opens a scene in the Godot editor (switching to its tab) so it can be edited live with editor_add_node, editor_set_properties and editor_remove_node.",
+  { scene_path: z.string().describe('e.g. "res://scenes/Main.tscn" or "scenes/Main.tscn"') },
+  ({ scene_path }) => bridgeTool({ command: "open_scene", args: { scene_path } })
+);
+
+server.tool(
+  "editor_add_node",
+  "Adds a node to the scene open in the Godot editor. It appears live and is selected; undo with Ctrl+Z. The scene is not saved until editor_save_scene (or the user saves). Prefer this over add_node while the editor is open.",
+  {
+    parent_path: z.string().describe('Path of the parent node in the open scene, e.g. "." or "Player"'),
+    name: z.string(),
+    type: z.string().describe('Godot Node class, e.g. "Sprite2D"'),
+    properties: z
+      .record(z.string())
+      .optional()
+      .describe(
+        'Godot-syntax values, e.g. { "position": "Vector2(10, 20)", "shape": "RectangleShape2D.new()", "shape:size": "Vector2(32, 48)" }. ' +
+          'Strings need quotes ("\\"hi\\""); ClassName.new() creates a Resource; "prop:subprop" reaches into a resource. Applied in order.'
+      ),
+    script_path: z.string().optional().describe("Attach this script, e.g. res://scripts/coin.gd"),
+    scene_path: sceneGuard,
+  },
+  ({ parent_path, name, type, properties, script_path, scene_path }) =>
+    bridgeTool({ command: "add_node", args: { parent_path, name, type, properties, script_path, scene_path } })
+);
+
+server.tool(
+  "editor_set_properties",
+  "Sets properties on a node in the scene open in the Godot editor (live, undoable with Ctrl+Z, not saved until editor_save_scene).",
+  {
+    node_path: z.string().describe('Path in the open scene, "." for the root'),
+    properties: z.record(z.string()).describe('Godot-syntax values, e.g. { "position": "Vector2(100, 50)", "visible": "false" }'),
+    scene_path: sceneGuard,
+  },
+  ({ node_path, properties, scene_path }) =>
+    bridgeTool({ command: "set_properties", args: { node_path, properties, scene_path } })
+);
+
+server.tool(
+  "editor_remove_node",
+  "Removes a node (and its descendants) from the scene open in the Godot editor (live, undoable with Ctrl+Z).",
+  { node_path: z.string(), scene_path: sceneGuard },
+  ({ node_path, scene_path }) => bridgeTool({ command: "remove_node", args: { node_path, scene_path } })
+);
+
+server.tool(
+  "editor_save_scene",
+  "Saves the scene currently open in the Godot editor to disk (like Ctrl+S).",
+  {},
+  () => bridgeTool({ command: "save_scene" })
 );
 
 const transport = new StdioServerTransport();

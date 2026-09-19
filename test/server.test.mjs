@@ -27,7 +27,9 @@ after(() => {
 /** Starts the built server over stdio, runs `fn(call)`, and shuts it down. */
 async function withServer(env, fn) {
   const client = new Client({ name: "test", version: "0.0.0" });
-  await client.connect(new StdioClientTransport({ command: process.execPath, args: [serverEntry], env }));
+  // default to a dead bridge port so a real Godot editor on this machine can't affect the tests
+  const fullEnv = { GODOT_MCP_BRIDGE_URL: "ws://127.0.0.1:9", ...env };
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: [serverEntry], env: fullEnv }));
   const call = async (name, args = {}) => {
     const res = await client.callTool({ name, arguments: args });
     return { isError: !!res.isError, text: res.content[0].text };
@@ -39,15 +41,18 @@ async function withServer(env, fn) {
   }
 }
 
-test("exposes all 14 tools", async () => {
+test("exposes all 20 tools", async () => {
   await withServer({}, async (_call, client) => {
     const { tools } = await client.listTools();
     assert.deepEqual(
       tools.map((t) => t.name).sort(),
       [
-        "add_node", "create_scene", "edit_script", "editor_get_selection", "editor_ping",
-        "editor_run_scene", "editor_stop", "list_project", "read_scene", "read_script",
-        "remove_node", "run_headless", "set_node_properties", "write_script",
+        "add_node", "create_scene", "edit_script",
+        "editor_add_node", "editor_get_scene_tree", "editor_get_selection", "editor_open_scene",
+        "editor_ping", "editor_remove_node", "editor_run_scene", "editor_save_scene",
+        "editor_set_properties", "editor_stop",
+        "list_project", "read_scene", "read_script", "remove_node", "run_headless",
+        "set_node_properties", "write_script",
       ]
     );
   });
@@ -145,7 +150,11 @@ test("editor_* tools fail fast with a helpful message when Godot isn't running",
   });
 });
 
-test("editor_* tools speak the bridge protocol", async () => {
+/**
+ * Runs `fn(call, seen)` against a server whose editor bridge is a mock WebSocket server.
+ * `handler(msg)` returns the `result` (or `{ error }` to fail); `seen` collects the received messages.
+ */
+async function withMockBridge(handler, fn) {
   const seen = [];
   const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   await new Promise((resolve) => wss.on("listening", resolve));
@@ -153,27 +162,129 @@ test("editor_* tools speak the bridge protocol", async () => {
     ws.on("message", (raw) => {
       const msg = JSON.parse(raw.toString());
       seen.push(msg);
-      const results = {
-        ping: { status: "alive" },
-        run_scene: { playing: msg.args?.scene_path },
-        stop: { stopped: true },
-        get_selection: { selected: ["/root/Main/Player"] },
-      };
-      ws.send(JSON.stringify({ id: msg.id, ok: true, result: results[msg.command], error: null }));
+      const out = handler(msg) ?? {};
+      const reply = out.error
+        ? { id: msg.id, ok: false, result: null, error: out.error }
+        : { id: msg.id, ok: true, result: out, error: null };
+      ws.send(JSON.stringify(reply));
     });
   });
-
   try {
     const url = `ws://127.0.0.1:${wss.address().port}`;
-    await withServer({ GODOT_MCP_BRIDGE_URL: url }, async (call) => {
-      assert.match((await call("editor_ping")).text, /alive/);
-      assert.match((await call("editor_run_scene", { scene_path: "res://scenes/Main.tscn" })).text, /res:\/\/scenes\/Main\.tscn/);
-      assert.match((await call("editor_stop")).text, /stopped/);
-      assert.match((await call("editor_get_selection")).text, /Player/);
-    });
-    assert.deepEqual(seen.map((m) => m.command), ["ping", "run_scene", "stop", "get_selection"]);
-    assert.deepEqual(seen[1].args, { scene_path: "res://scenes/Main.tscn" });
+    await withServer({ GODOT_MCP_BRIDGE_URL: url }, (call) => fn(call, seen));
   } finally {
     wss.close();
   }
+}
+
+test("editor_* tools speak the bridge protocol", async () => {
+  const handler = (msg) =>
+    ({
+      ping: { status: "alive" },
+      run_scene: { playing: msg.args?.scene_path },
+      stop: { stopped: true },
+      get_selection: { selected: ["/root/Main/Player"] },
+    })[msg.command];
+
+  await withMockBridge(handler, async (call, seen) => {
+    assert.match((await call("editor_ping")).text, /alive/);
+    assert.match((await call("editor_run_scene", { scene_path: "res://scenes/Main.tscn" })).text, /res:\/\/scenes\/Main\.tscn/);
+    assert.match((await call("editor_stop")).text, /stopped/);
+    assert.match((await call("editor_get_selection")).text, /Player/);
+    assert.deepEqual(seen.map((m) => m.command), ["ping", "run_scene", "stop", "get_selection"]);
+    assert.deepEqual(seen[1].args, { scene_path: "res://scenes/Main.tscn" });
+  });
+});
+
+test("live-edit tools send the right commands and arguments", async () => {
+  await withMockBridge(() => ({ ok: "fine" }), async (call, seen) => {
+    await call("editor_get_scene_tree");
+    await call("editor_open_scene", { scene_path: "scenes/Main.tscn" });
+    await call("editor_add_node", {
+      parent_path: ".", name: "Coin", type: "Area2D",
+      properties: { position: "Vector2(10, 20)", shape: "RectangleShape2D.new()" },
+    });
+    await call("editor_set_properties", { node_path: "Coin", properties: { visible: "false" }, scene_path: "res://scenes/Main.tscn" });
+    await call("editor_remove_node", { node_path: "Coin" });
+    await call("editor_save_scene");
+
+    assert.deepEqual(seen.map((m) => m.command), [
+      "get_scene_tree", "open_scene", "add_node", "set_properties", "remove_node", "save_scene",
+    ]);
+    assert.deepEqual(seen[2].args, {
+      parent_path: ".", name: "Coin", type: "Area2D",
+      properties: { position: "Vector2(10, 20)", shape: "RectangleShape2D.new()" },
+    });
+    assert.deepEqual(seen[3].args, {
+      node_path: "Coin", properties: { visible: "false" }, scene_path: "res://scenes/Main.tscn",
+    });
+  });
+});
+
+test("an error reported by the editor bridge becomes an isError result", async () => {
+  await withMockBridge(() => ({ error: "parent node 'Nope' not found in the open scene" }), async (call) => {
+    const res = await call("editor_add_node", { parent_path: "Nope", name: "X", type: "Node2D" });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /parent node 'Nope' not found/);
+  });
+});
+
+test("file tools refuse to edit a scene that is open in the editor, but only that scene and project", async () => {
+  const scene = path.join(proj, "scenes/Guarded.tscn");
+  const other = path.join(proj, "scenes/Free.tscn");
+  fs.writeFileSync(scene, '[gd_scene format=3]\n\n[node name="G" type="Node2D"]\n');
+  fs.writeFileSync(other, '[gd_scene format=3]\n\n[node name="F" type="Node2D"]\n');
+  const before = fs.readFileSync(scene, "utf8");
+  const editorState = (project_path) => ({ project_path, open: ["res://scenes/Guarded.tscn"], current: "res://scenes/Guarded.tscn" });
+  const add = (scene_path) => ({ project_path: proj, scene_path, parent_path: ".", name: "Child", type: "Node2D" });
+
+  // same project (the editor reports it with forward slashes and a trailing slash)
+  const editorPath = proj.replace(/\\/g, "/") + "/";
+  await withMockBridge((msg) => msg.command === "get_open_scenes" && editorState(editorPath), async (call) => {
+    for (const [tool, args] of [
+      ["add_node", add("scenes/Guarded.tscn")],
+      ["remove_node", { project_path: proj, scene_path: "scenes/Guarded.tscn", node_path: "G" }],
+      ["set_node_properties", { project_path: proj, scene_path: "res://scenes/Guarded.tscn", node_path: ".", properties: { visible: "false" } }],
+      ["create_scene", { project_path: proj, scene_path: "scenes/Guarded.tscn", root_name: "G", root_type: "Node2D", overwrite: true }],
+    ]) {
+      const res = await call(tool, args);
+      assert.equal(res.isError, true, tool);
+      assert.match(res.text, /open in the Godot editor/, tool);
+      assert.match(res.text, /editor_add_node/, tool);
+    }
+    assert.equal(fs.readFileSync(scene, "utf8"), before, "guarded scene must be untouched");
+
+    // a scene the editor does not have open is still editable on disk
+    assert.equal((await call("add_node", add("scenes/Free.tscn"))).isError, false);
+  });
+
+  // the editor has a different project open: no guard
+  await withMockBridge((msg) => msg.command === "get_open_scenes" && editorState(path.join(tmp, "another-project")), async (call) => {
+    assert.equal((await call("add_node", add("scenes/Guarded.tscn"))).isError, false);
+  });
+
+  // an older plugin that doesn't know get_open_scenes: no guard
+  await withMockBridge((msg) => msg.command === "get_open_scenes" && { error: "unknown command: get_open_scenes" }, async (call) => {
+    assert.equal((await call("add_node", { ...add("scenes/Guarded.tscn"), name: "Child2" })).isError, false);
+  });
+});
+
+test("file tools reject GDScript-only values like RectangleShape2D.new() instead of corrupting the scene", async () => {
+  await withServer({}, async (call) => {
+    const scenePath = path.join(proj, "scenes/Main.tscn");
+    const before = fs.readFileSync(scenePath, "utf8");
+    const add = await call("add_node", {
+      project_path: proj, scene_path: "scenes/Main.tscn", parent_path: ".", name: "Shape", type: "CollisionShape2D",
+      properties: { shape: "RectangleShape2D.new()" },
+    });
+    assert.equal(add.isError, true);
+    assert.match(add.text, /GDScript, not scene-file syntax/);
+    assert.match(add.text, /editor_add_node/);
+
+    const set = await call("set_node_properties", {
+      project_path: proj, scene_path: "scenes/Main.tscn", node_path: "Player/CollisionShape2D", properties: { shape: "CircleShape2D.new()" },
+    });
+    assert.equal(set.isError, true);
+    assert.equal(fs.readFileSync(scenePath, "utf8"), before);
+  });
 });

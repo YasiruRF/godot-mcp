@@ -23,7 +23,10 @@ export interface BridgeResponse {
 
 let idCounter = 0;
 
-export async function callBridge(req: BridgeRequest): Promise<BridgeResponse> {
+export async function callBridge(
+  req: BridgeRequest,
+  timeoutMs: number = CONNECT_TIMEOUT_MS + REQUEST_TIMEOUT_MS
+): Promise<BridgeResponse> {
   const url = DEFAULT_URL;
   const ws = new WebSocket(url);
   const id = ++idCounter;
@@ -37,7 +40,7 @@ export async function callBridge(req: BridgeRequest): Promise<BridgeResponse> {
             `godot_mcp_bridge plugin enabled (Project Settings > Plugins)?`
         )
       );
-    }, CONNECT_TIMEOUT_MS + REQUEST_TIMEOUT_MS);
+    }, timeoutMs);
 
     ws.on("error", (err) => {
       clearTimeout(timeout);
