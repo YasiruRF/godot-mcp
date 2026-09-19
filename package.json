@@ -2,6 +2,7 @@
   "name": "godot-mcp",
   "version": "0.1.0",
   "description": "MCP server for authoring and inspecting Godot 4 projects (scenes, scripts, headless runs), with an optional live editor bridge.",
+  "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -18,7 +19,8 @@
   },
   "files": [
     "dist",
-    "sample-project/addons"
+    "sample-project/addons",
+    "LICENSE"
   ],
   "keywords": [
     "mcp",
