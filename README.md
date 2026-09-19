@@ -11,6 +11,10 @@ optionally drive a *running* Godot editor over a local WebSocket bridge.
   editor. They let Claude edit the open scene *inside* the editor — you watch
   each node appear, and Ctrl+Z undoes it — and play/stop scenes.
 
+[![godot-mcp: how it works today — click to watch the 23-second demo](public/godot-mcp-poster.jpg)](public/godot-mcp.mp4)
+
+*New to Godot? Click the picture for a 23-second look at how godot-mcp works today.*
+
 ```
 godot-mcp/
 ├── src/                  # the MCP server (TypeScript)
