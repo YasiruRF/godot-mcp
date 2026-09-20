@@ -45,7 +45,34 @@ crates, to the glowing goal pad. R restarts.
 
 ## Quick start
 
-Requires **Node.js 18+**.
+Requires **Node.js 18+**. No install step: your MCP client runs the published
+package through `npx`.
+
+**Claude Code**
+
+```bash
+claude mcp add godot -- npx -y @yasirurf/godot-mcp
+```
+
+Or add it by hand to a project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "godot": {
+      "command": "npx",
+      "args": ["-y", "@yasirurf/godot-mcp"]
+    }
+  }
+}
+```
+
+**Claude Desktop** — add the same `mcpServers` entry to
+`claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`,
+Windows: `%APPDATA%\Claude\`), then restart the app.
+
+<details>
+<summary>Run from source instead</summary>
 
 ```bash
 git clone https://github.com/YasiruRF/godot-mcp.git
@@ -54,34 +81,16 @@ npm install
 npm run build
 ```
 
-Register the built server with your MCP client. Use the **absolute path** to
-`dist/index.js`.
-
-**Claude Code**
+Register the built server using the **absolute path** to `dist/index.js`:
 
 ```bash
 claude mcp add godot -- node /absolute/path/to/godot-mcp/dist/index.js
 ```
 
-On Windows use a Windows path, e.g. `node C:\dev\godot-mcp\dist\index.js`.
+On Windows use a Windows path, e.g. `node C:\dev\godot-mcp\dist\index.js`, and
+escape the backslashes in JSON: `"C:\\dev\\godot-mcp\\dist\\index.js"`.
 
-Or add it by hand to a project's `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "godot": {
-      "command": "node",
-      "args": ["/absolute/path/to/godot-mcp/dist/index.js"]
-    }
-  }
-}
-```
-
-**Claude Desktop** — add the same `mcpServers` entry to
-`claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`,
-Windows: `%APPDATA%\Claude\`), then restart the app. In JSON on Windows,
-escape backslashes: `"C:\\dev\\godot-mcp\\dist\\index.js"`.
+</details>
 
 Then ask Claude something like *"List everything in the Godot project at
 `/path/to/my-game`"*. If it returns your scenes and scripts, you're set.
@@ -271,8 +280,8 @@ Set them in your MCP client config, for example:
 {
   "mcpServers": {
     "godot": {
-      "command": "node",
-      "args": ["/absolute/path/to/godot-mcp/dist/index.js"],
+      "command": "npx",
+      "args": ["-y", "@yasirurf/godot-mcp"],
       "env": { "GODOT_BIN": "C:\\Godot\\Godot_v4.3-stable_win64_console.exe" }
     }
   }
