@@ -135,3 +135,65 @@ test("removeNode refuses the root and unknown paths", () => {
   assert.throws(() => removeNode(file, "."), /root/);
   assert.throws(() => removeNode(file, "Nope"), /No node found/);
 });
+
+// Constructs Godot 4 writes that a hand-rolled parser could plausibly mangle: a node uid and
+// unique_id, instanced children with editable-children, strings containing brackets and
+// `[node ...]`-looking text, multi-line values, packed arrays and several [connection] blocks.
+const TRICKY_SCENE = `[gd_scene load_steps=4 format=3 uid="uid://dq3p5x7k2m1ab"]
+
+[ext_resource type="PackedScene" uid="uid://bq1xcoin" path="res://scenes/Coin.tscn" id="1_coin"]
+[ext_resource type="Script" path="res://scripts/game.gd" id="2_game"]
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_a1b2c"]
+size = Vector3(2, 2, 2)
+
+[sub_resource type="Gradient" id="Gradient_x9"]
+offsets = PackedFloat32Array(0, 0.5, 1)
+colors = PackedColorArray(1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1)
+
+[node name="Main" type="Node3D" unique_id=123456789]
+script = ExtResource("2_game")
+metadata/notes = {
+"a": [1, 2, 3],
+"b": "closing ] bracket and [node name=\\"fake\\"] text"
+}
+
+[node name="Coin" parent="." unique_id=987654321 instance=ExtResource("1_coin")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 4, 0.5, -3)
+
+[node name="Label" type="Label" parent="." unique_id=555]
+text = "Score [0] of [10]\\nline two"
+
+[node name="Shape" type="CollisionShape3D" parent="Coin" unique_id=42]
+shape = SubResource("BoxShape3D_a1b2c")
+
+[connection signal="body_entered" from="Coin" to="." method="_on_coin_body_entered" flags=3]
+[connection signal="ready" from="Label" to="." method="_on_label_ready"]
+
+[editable path="Coin"]
+`;
+
+test("a Godot 4 scene with uid, unique_id, multi-line values and brackets in strings round-trips byte for byte", () => {
+  assert.equal(serializeTscn(parseTscn(TRICKY_SCENE)), TRICKY_SCENE);
+});
+
+test("editing a tricky scene changes only what was asked", () => {
+  const file = parseTscn(TRICKY_SCENE);
+  addNode(file, { name: "Extra", type: "Node3D", parentPath: "." });
+  setNodeProperties(file, "Label", { visible: "false" });
+  const out = serializeTscn(file);
+
+  // everything from the original is still there, in order, apart from the two edits
+  for (const keep of [
+    'unique_id=123456789', 'unique_id=987654321', '"b": "closing ] bracket and [node name=\\"fake\\"] text"',
+    'PackedColorArray(1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1)', '[editable path="Coin"]',
+    '[connection signal="body_entered" from="Coin" to="." method="_on_coin_body_entered" flags=3]',
+  ]) {
+    assert.ok(out.includes(keep), `lost: ${keep}`);
+  }
+  assert.match(out, /\[node name="Extra" type="Node3D" parent="\."\]/);
+  assert.ok(out.indexOf('[node name="Extra"') < out.indexOf("[connection"), "new nodes go before the connections");
+  assert.ok(out.indexOf("[connection") < out.indexOf("[editable"), "connections stay before editable");
+  const tree = getSceneTree(parseTscn(out));
+  assert.deepEqual(tree.map((n) => n.path).sort(), [".", "Coin", "Coin/Shape", "Extra", "Label"].sort());
+});

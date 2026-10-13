@@ -5,10 +5,27 @@
  * call here fails fast with a clear message instead of hanging.
  */
 import WebSocket from "ws";
+import { readFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const DEFAULT_URL = process.env.GODOT_MCP_BRIDGE_URL ?? "ws://127.0.0.1:9080";
 const CONNECT_TIMEOUT_MS = 1500;
 const REQUEST_TIMEOUT_MS = 8000;
+
+/**
+ * The plugin writes a random token here when it starts and sends every request back to be
+ * checked against it. Other users' processes and web pages cannot read the file, so they
+ * cannot drive the editor even though the port is open on localhost.
+ */
+function readToken(): string | undefined {
+  const file = process.env.GODOT_MCP_BRIDGE_TOKEN_FILE ?? path.join(os.homedir(), ".godot-mcp", "bridge-token");
+  try {
+    return readFileSync(file, "utf-8").trim() || undefined;
+  } catch {
+    return undefined; // no editor running, or a plugin that predates tokens
+  }
+}
 
 export interface BridgeRequest {
   command: string;
@@ -59,7 +76,7 @@ export async function callBridge(
     });
 
     ws.on("open", () => {
-      ws.send(JSON.stringify({ id, ...req }));
+      ws.send(JSON.stringify({ id, token: readToken(), ...req }));
     });
 
     ws.on("message", (data) => {
