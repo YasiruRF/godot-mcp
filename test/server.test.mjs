@@ -41,16 +41,16 @@ async function withServer(env, fn) {
   }
 }
 
-test("exposes all 20 tools", async () => {
+test("exposes all 24 tools", async () => {
   await withServer({}, async (_call, client) => {
     const { tools } = await client.listTools();
     assert.deepEqual(
       tools.map((t) => t.name).sort(),
       [
-        "add_node", "create_scene", "edit_script",
+        "add_node", "allow_paths", "begin_task", "create_scene", "edit_script",
         "editor_add_node", "editor_get_scene_tree", "editor_get_selection", "editor_open_scene",
         "editor_ping", "editor_remove_node", "editor_run_scene", "editor_save_scene",
-        "editor_set_properties", "editor_stop",
+        "editor_set_properties", "editor_stop", "end_task", "get_change_summary",
         "list_project", "read_scene", "read_script", "remove_node", "run_headless",
         "set_node_properties", "write_script",
       ]
@@ -233,43 +233,204 @@ test("an error reported by the editor bridge becomes an isError result", async (
   });
 });
 
-test("file tools refuse to edit a scene that is open in the editor, but only that scene and project", async () => {
+test("create_scene overwrite refuses a scene that is open in the editor", async () => {
+  const scene = path.join(proj, "scenes/Guarded.tscn");
+  fs.writeFileSync(scene, '[gd_scene format=3]\n\n[node name="G" type="Node2D"]\n');
+  const before = fs.readFileSync(scene, "utf8");
+  const state = { project_path: proj.replace(/\\/g, "/") + "/", open: ["res://scenes/Guarded.tscn"], current: "res://scenes/Guarded.tscn" };
+  await withMockBridge((msg) => msg.command === "get_open_scenes" && state, async (call) => {
+    const res = await call("create_scene", { project_path: proj, scene_path: "scenes/Guarded.tscn", root_name: "G", root_type: "Node2D", overwrite: true });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /open in the Godot editor/);
+    assert.equal(fs.readFileSync(scene, "utf8"), before);
+  });
+});
+
+test("add/set/remove route themselves: live when the editor has the scene open, disk otherwise", async () => {
   const scene = path.join(proj, "scenes/Guarded.tscn");
   const other = path.join(proj, "scenes/Free.tscn");
   fs.writeFileSync(scene, '[gd_scene format=3]\n\n[node name="G" type="Node2D"]\n');
   fs.writeFileSync(other, '[gd_scene format=3]\n\n[node name="F" type="Node2D"]\n');
   const before = fs.readFileSync(scene, "utf8");
-  const editorState = (project_path) => ({ project_path, open: ["res://scenes/Guarded.tscn"], current: "res://scenes/Guarded.tscn" });
-  const add = (scene_path) => ({ project_path: proj, scene_path, parent_path: ".", name: "Child", type: "Node2D" });
-
-  // same project (the editor reports it with forward slashes and a trailing slash)
   const editorPath = proj.replace(/\\/g, "/") + "/";
-  await withMockBridge((msg) => msg.command === "get_open_scenes" && editorState(editorPath), async (call) => {
-    for (const [tool, args] of [
-      ["add_node", add("scenes/Guarded.tscn")],
-      ["remove_node", { project_path: proj, scene_path: "scenes/Guarded.tscn", node_path: "G" }],
-      ["set_node_properties", { project_path: proj, scene_path: "res://scenes/Guarded.tscn", node_path: ".", properties: { visible: "false" } }],
-      ["create_scene", { project_path: proj, scene_path: "scenes/Guarded.tscn", root_name: "G", root_type: "Node2D", overwrite: true }],
-    ]) {
-      const res = await call(tool, args);
-      assert.equal(res.isError, true, tool);
-      assert.match(res.text, /open in the Godot editor/, tool);
-      assert.match(res.text, /editor_add_node/, tool);
-    }
-    assert.equal(fs.readFileSync(scene, "utf8"), before, "guarded scene must be untouched");
+  const state = (project_path, current = "res://scenes/Guarded.tscn") => ({ project_path, open: ["res://scenes/Guarded.tscn"], current });
+  const add = (scene_path, extra = {}) => ({ project_path: proj, scene_path, parent_path: ".", name: "Child", type: "Node2D", ...extra });
 
-    // a scene the editor does not have open is still editable on disk
-    assert.equal((await call("add_node", add("scenes/Free.tscn"))).isError, false);
+  // scene open and active: live edits, file untouched, result says so
+  await withMockBridge((msg) => msg.command === "get_open_scenes" && state(editorPath), async (call, seen) => {
+    const a = await call("add_node", add("scenes/Guarded.tscn", { properties: { shape: "RectangleShape2D.new()" } }));
+    assert.equal(a.isError, false);
+    assert.match(a.text, /live in the Godot editor/);
+    assert.match(a.text, /Ctrl\+Z/);
+    assert.match((await call("set_node_properties", { project_path: proj, scene_path: "res://scenes/Guarded.tscn", node_path: ".", properties: { visible: "false" } })).text, /live in the Godot editor/);
+    assert.match((await call("remove_node", { project_path: proj, scene_path: "scenes/Guarded.tscn", node_path: "Child" })).text, /live in the Godot editor/);
+    assert.equal(fs.readFileSync(scene, "utf8"), before, "the file on disk must be untouched");
+
+    const live = seen.filter((m) => m.command !== "get_open_scenes");
+    assert.deepEqual(live.map((m) => m.command), ["add_node", "set_properties", "remove_node"]);
+    assert.equal(live[0].args.scene_path, "res://scenes/Guarded.tscn");
+    assert.equal(live[0].args.properties.shape, "RectangleShape2D.new()"); // GDScript syntax is fine live
+    assert.deepEqual(live[1].args.properties, { visible: "false" });
+
+    // a scene the editor does not have open is still edited on disk, and says so
+    const d = await call("add_node", add("scenes/Free.tscn"));
+    assert.equal(d.isError, false);
+    assert.match(d.text, /on disk/);
+    assert.match(fs.readFileSync(other, "utf8"), /name="Child"/);
   });
 
-  // the editor has a different project open: no guard
-  await withMockBridge((msg) => msg.command === "get_open_scenes" && editorState(path.join(tmp, "another-project")), async (call) => {
-    assert.equal((await call("add_node", add("scenes/Guarded.tscn"))).isError, false);
+  // open in the editor but another tab is showing: it switches to the scene's tab first
+  await withMockBridge((msg) => msg.command === "get_open_scenes" && state(editorPath, "res://scenes/Other.tscn"), async (call, seen) => {
+    const res = await call("add_node", add("scenes/Guarded.tscn", { name: "Switched" }));
+    assert.equal(res.isError, false);
+    assert.match(res.text, /switching to that scene's tab/);
+    assert.deepEqual(seen.map((m) => m.command), ["get_open_scenes", "open_scene", "add_node"]);
   });
 
-  // an older plugin that doesn't know get_open_scenes: no guard
+  // the editor has a different project open: disk
+  await withMockBridge((msg) => msg.command === "get_open_scenes" && state(path.join(tmp, "another-project")), async (call) => {
+    assert.match((await call("add_node", add("scenes/Guarded.tscn", { name: "OnDisk" }))).text, /on disk/);
+  });
+
+  // an older plugin that doesn't know get_open_scenes: disk, no error
   await withMockBridge((msg) => msg.command === "get_open_scenes" && { error: "unknown command: get_open_scenes" }, async (call) => {
-    assert.equal((await call("add_node", { ...add("scenes/Guarded.tscn"), name: "Child2" })).isError, false);
+    assert.equal((await call("add_node", add("scenes/Guarded.tscn", { name: "OnDisk2" }))).isError, false);
+  });
+
+  // a failure from the live edit is reported, never retried on disk
+  await withMockBridge((msg) => (msg.command === "get_open_scenes" ? state(editorPath) : { error: "parent node 'Nope' not found in the open scene" }), async (call) => {
+    const res = await call("add_node", add("scenes/Guarded.tscn", { parent_path: "Nope", name: "Never" }));
+    assert.equal(res.isError, true);
+    assert.match(res.text, /parent node 'Nope' not found/);
+    assert.doesNotMatch(fs.readFileSync(scene, "utf8"), /Never/);
+  });
+});
+
+test("begin_task/end_task: one undo batch, a plain-language summary, files touched", async () => {
+  const editorPath = proj.replace(/\\/g, "/") + "/";
+  const handler = (msg) => {
+    if (msg.command === "get_open_scenes") return { project_path: editorPath, open: ["res://scenes/Main.tscn"], current: "res://scenes/Main.tscn" };
+    if (msg.command === "end_batch") return { batch: "add crate", operations: 2 };
+    return {};
+  };
+  await withMockBridge(handler, async (call, seen) => {
+    const begin = await call("begin_task", { label: "add crate" });
+    assert.equal(begin.isError, false);
+    assert.match(begin.text, /one undo step/);
+    assert.equal((await call("begin_task", { label: "again" })).isError, true); // no nesting
+
+    await call("add_node", { project_path: proj, scene_path: "scenes/Main.tscn", parent_path: ".", name: "Crate", type: "StaticBody3D", properties: { position: "Vector3(3, 1, -20)" } });
+    await call("set_node_properties", { project_path: proj, scene_path: "scenes/Main.tscn", node_path: "Crate", properties: { visible: "true" } });
+
+    const mid = await call("get_change_summary");
+    assert.match(mid.text, /Added a `StaticBody3D` named `Crate` under the scene root \(position = Vector3\(3, 1, -20\)\)/);
+    assert.match(mid.text, /a body that never moves/);
+
+    const end = await call("end_task");
+    assert.equal(end.isError, false);
+    assert.match(end.text, /Finished "add crate"/);
+    assert.match(end.text, /One Ctrl\+Z in the editor undoes all 2 live edits/);
+    assert.match(end.text, /Files touched: scenes\/Main\.tscn/);
+    assert.doesNotMatch(end.text, /\+\d+ −\d+/); // not a diff stat
+    assert.equal(seen.filter((m) => m.command === "begin_batch")[0].args.label, "add crate");
+    assert.equal(seen.filter((m) => m.command === "end_batch").length, 1);
+
+    assert.equal((await call("end_task")).isError, true); // nothing open any more
+    assert.match((await call("get_change_summary")).text, /Nothing has been changed yet/);
+  });
+});
+
+test("begin_task works without an editor and explains an older plugin", async () => {
+  await withServer({}, async (call) => {
+    const begin = await call("begin_task", { label: "disk only" });
+    assert.equal(begin.isError, false);
+    assert.match(begin.text, /not reachable/);
+    await call("end_task");
+  });
+  await withMockBridge((msg) => msg.command === "begin_batch" && { error: "unknown command: begin_batch" }, async (call) => {
+    const begin = await call("begin_task", { label: "old plugin" });
+    assert.equal(begin.isError, false);
+    assert.match(begin.text, /older than this server/);
+    await call("end_task");
+  });
+});
+
+test("scope discipline: working set, protected files, widening, and the mass-edit cap", async () => {
+  await withServer({}, async (call) => {
+    const pj = path.join(proj, "project.godot");
+    const pjBefore = fs.readFileSync(pj, "utf8");
+    const plugin = path.join(proj, "addons/godot_mcp_bridge/godot_mcp_bridge.gd");
+    const pluginBefore = fs.readFileSync(plugin, "utf8");
+
+    // protected files are refused even with no task declared
+    for (const script_path of ["project.godot", "addons/godot_mcp_bridge/godot_mcp_bridge.gd"]) {
+      const res = await call("write_script", { project_path: proj, script_path, content: "x" });
+      assert.equal(res.isError, true, script_path);
+    }
+    const prot = await call("write_script", { project_path: proj, script_path: "addons/evil.gd", content: "x" });
+    assert.match(prot.text, /off limits by default/);
+    assert.match(prot.text, /allow_paths/);
+    assert.equal(fs.readFileSync(pj, "utf8"), pjBefore);
+    assert.equal(fs.readFileSync(plugin, "utf8"), pluginBefore);
+    assert.equal(fs.existsSync(path.join(proj, "addons/evil.gd")), false);
+
+    // only script/shader files can be written through the script tools
+    const ext = await call("write_script", { project_path: proj, script_path: "notes.cfg", content: "x" });
+    assert.equal(ext.isError, true);
+    assert.match(ext.text, /not a GDScript or shader file/);
+
+    // a declared working set
+    await call("begin_task", { label: "tweak player", paths: ["scripts/player.gd", "scenes/"] });
+    assert.equal((await call("edit_script", { project_path: proj, script_path: "scripts/player.gd", old_text: "extends", new_text: "extends" })).isError, false);
+    const out = await call("write_script", { project_path: proj, script_path: "scripts/game.gd", content: "extends Node\n" });
+    assert.equal(out.isError, true);
+    assert.match(out.text, /outside this task's working set/);
+    assert.match(out.text, /ask them to confirm/);
+    assert.notEqual(fs.readFileSync(path.join(proj, "scripts/game.gd"), "utf8"), "extends Node\n");
+
+    // widening deliberately
+    assert.match((await call("allow_paths", { paths: ["scripts/game.gd"] })).text, /Allowed/);
+    assert.equal((await call("write_script", { project_path: proj, script_path: "scripts/game.gd", content: fs.readFileSync(path.join(proj, "scripts/game.gd"), "utf8") })).isError, false);
+
+    // naming a protected file in the working set is the explicit opt-in
+    await call("allow_paths", { paths: ["addons/evil.gd"] });
+    assert.equal((await call("write_script", { project_path: proj, script_path: "addons/evil.gd", content: "extends Node\n" })).isError, false);
+
+    const end = await call("end_task");
+    assert.match(end.text, /Refused as out of scope: scripts\/game\.gd/);
+    assert.match(end.text, /Files touched: .*scripts\/game\.gd/);
+    fs.rmSync(path.join(proj, "addons/evil.gd"), { force: true });
+  });
+
+  // mass edits ask first
+  await withServer({ GODOT_MCP_MAX_FILES: "3" }, async (call) => {
+    for (const n of [1, 2, 3]) {
+      assert.equal((await call("write_script", { project_path: proj, script_path: `scripts/mass${n}.gd`, content: "extends Node\n" })).isError, false);
+    }
+    assert.equal((await call("write_script", { project_path: proj, script_path: "scripts/mass2.gd", content: "extends Node\n# again\n" })).isError, false); // same file again is fine
+    const fourth = await call("write_script", { project_path: proj, script_path: "scripts/mass4.gd", content: "extends Node\n" });
+    assert.equal(fourth.isError, true);
+    assert.match(fourth.text, /already changed 3 files/);
+    assert.equal(fs.existsSync(path.join(proj, "scripts/mass4.gd")), false);
+    // a task that explicitly names the file has the go-ahead
+    await call("end_task").catch(() => {});
+    await call("begin_task", { label: "more", paths: ["scripts/"] });
+    assert.equal((await call("write_script", { project_path: proj, script_path: "scripts/mass4.gd", content: "extends Node\n" })).isError, false);
+  });
+});
+
+test("editor_* write twins respect the working set", async () => {
+  const editorPath = proj.replace(/\\/g, "/") + "/";
+  const handler = (msg) =>
+    msg.command === "get_open_scenes"
+      ? { project_path: editorPath, open: ["res://scenes/Main.tscn"], current: "res://scenes/Main.tscn" }
+      : {};
+  await withMockBridge(handler, async (call, seen) => {
+    await call("begin_task", { label: "scripts only", paths: ["scripts/"] });
+    const res = await call("editor_add_node", { parent_path: ".", name: "X", type: "Node2D" });
+    assert.equal(res.isError, true);
+    assert.match(res.text, /outside this task's working set/);
+    assert.equal(seen.some((m) => m.command === "add_node"), false, "the edit must not reach the editor");
   });
 });
 

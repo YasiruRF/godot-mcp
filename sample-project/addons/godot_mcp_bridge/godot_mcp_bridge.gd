@@ -15,9 +15,21 @@ extends EditorPlugin
 
 const PORT := 9080
 const BAD_NAME_CHARS := ".:@/\"%"
+## A batch with no edits for this long is closed (committed as one undo step) on its own, so a
+## client that crashes mid-task can never leave the undo history open.
+const BATCH_IDLE_MSEC := 120000
 
 var _tcp_server := TCPServer.new()
 var _peers: Array = []
+
+# Batch state (see begin_batch / end_batch). While a batch is open, edits are applied to the
+# scene immediately, as usual, but recorded instead of each becoming its own undo entry; closing
+# the batch registers them all as ONE undo action.
+var _batch_open := false
+var _batch_label := ""
+var _batch_ops: Array = []
+var _batch_root_id := 0
+var _batch_last_msec := 0
 
 func _enter_tree() -> void:
 	var err := _tcp_server.listen(PORT, "127.0.0.1")
@@ -27,12 +39,16 @@ func _enter_tree() -> void:
 		print("godot_mcp_bridge: listening on ws://127.0.0.1:%d" % PORT)
 
 func _exit_tree() -> void:
+	_close_batch()
 	for p in _peers:
 		(p["ws"] as WebSocketPeer).close()
 	_peers.clear()
 	_tcp_server.stop()
 
 func _process(_delta: float) -> void:
+	if _batch_open and Time.get_ticks_msec() - _batch_last_msec > BATCH_IDLE_MSEC:
+		_close_batch()
+
 	while _tcp_server.is_connection_available():
 		var tcp := _tcp_server.take_connection()
 		var ws := WebSocketPeer.new()
@@ -161,13 +177,12 @@ func _cmd_add_node(args: Dictionary) -> Dictionary:
 			node.free()
 			return _fail(prop_err)
 
-	var ur := get_undo_redo()
-	ur.create_action("MCP: add %s" % node_name)
-	ur.add_do_method(parent, "add_child", node, true)
-	ur.add_do_method(node, "set_owner", root)
-	ur.add_do_reference(node)
-	ur.add_undo_method(parent, "remove_child", node)
-	ur.commit_action()
+	_run_op("MCP: add %s" % node_name, root, {
+		"do": [[parent, "add_child", node, true], [node, "set_owner", root]],
+		"undo": [[parent, "remove_child", node]],
+		"do_refs": [node],
+		"undo_refs": [],
+	})
 
 	_select_only(node)  # so the edit is visible in the Scene and Inspector docks
 	return _ok({"added": str(root.get_path_to(node)), "type": node_type})
@@ -199,13 +214,15 @@ func _cmd_set_properties(args: Dictionary) -> Dictionary:
 		keys.append(prop_key)
 		new_values.append(parsed["value"])
 
-	var ur := get_undo_redo()
-	ur.create_action("MCP: set properties on %s" % node.name)
+	var do_calls: Array = []
+	var undo_calls: Array = []
 	for i in keys.size():
 		var path := NodePath(keys[i])
-		ur.add_do_method(node, "set_indexed", path, new_values[i])
-		ur.add_undo_method(node, "set_indexed", path, node.get_indexed(path))
-	ur.commit_action()
+		do_calls.append([node, "set_indexed", path, new_values[i]])
+		undo_calls.append([node, "set_indexed", path, node.get_indexed(path)])
+	_run_op("MCP: set properties on %s" % node.name, root, {
+		"do": do_calls, "undo": undo_calls, "do_refs": [], "undo_refs": [],
+	})
 
 	_select_only(node)
 	return _ok({"updated": node_path, "properties": keys})
@@ -225,15 +242,15 @@ func _cmd_remove_node(args: Dictionary) -> Dictionary:
 
 	var parent := node.get_parent()
 	var index := node.get_index()
-	var ur := get_undo_redo()
-	ur.create_action("MCP: remove %s" % node.name)
-	ur.add_do_method(parent, "remove_child", node)
-	ur.add_undo_method(parent, "add_child", node, true)
-	ur.add_undo_method(parent, "move_child", node, index)
+	var undo_calls: Array = [[parent, "add_child", node, true], [parent, "move_child", node, index]]
 	for owned in _owned_nodes(node, root):
-		ur.add_undo_method(owned, "set_owner", root)
-	ur.add_undo_reference(node)
-	ur.commit_action()
+		undo_calls.append([owned, "set_owner", root])
+	_run_op("MCP: remove %s" % node.name, root, {
+		"do": [[parent, "remove_child", node]],
+		"undo": undo_calls,
+		"do_refs": [],
+		"undo_refs": [node],
+	})
 	return _ok({"removed": node_path})
 
 func _cmd_save_scene() -> Dictionary:
@@ -246,6 +263,82 @@ func _cmd_save_scene() -> Dictionary:
 	if err != OK:
 		return _fail("save failed (error %d)" % err)
 	return _ok({"saved": root.scene_file_path})
+
+# ---------------------------------------------------------------------------
+# Undo batching: one agent task = one undo step
+# ---------------------------------------------------------------------------
+
+func _cmd_begin_batch(args: Dictionary) -> Dictionary:
+	if _batch_open:
+		return _fail("a batch is already open (\"%s\") — close it with end_batch first" % _batch_label)
+	var label := str(args.get("label", "")).strip_edges()
+	_batch_label = label if label != "" else "agent task"
+	_batch_open = true
+	_batch_ops = []
+	_batch_root_id = 0
+	_batch_last_msec = Time.get_ticks_msec()
+	return _ok({"batch": _batch_label})
+
+func _cmd_end_batch() -> Dictionary:
+	if not _batch_open:
+		return _ok({"batch": null, "operations": 0})
+	var label := _batch_label
+	var count := _batch_ops.size()
+	_close_batch()
+	return _ok({"batch": label, "operations": count})
+
+## Registers every recorded edit as a single undo action and closes the batch. The edits are
+## already applied, so the action is committed without executing them again.
+func _close_batch() -> void:
+	if not _batch_open:
+		return
+	_batch_open = false
+	var ops := _batch_ops
+	_batch_ops = []
+	if ops.is_empty():
+		return
+	var root = instance_from_id(_batch_root_id)
+	var ur := get_undo_redo()
+	ur.create_action("Claude: %s" % _batch_label, UndoRedo.MERGE_DISABLE, root)
+	for op in ops:
+		_add_calls(ur, op["do"], true)
+		for ref in op["do_refs"]:
+			ur.add_do_reference(ref)
+	# undo runs in the order the calls were added, so add the newest edit's undo first
+	for i in range(ops.size() - 1, -1, -1):
+		_add_calls(ur, ops[i]["undo"], false)
+		for ref in ops[i]["undo_refs"]:
+			ur.add_undo_reference(ref)
+	ur.commit_action(false)
+
+## An op is {"do": [[object, method, args...]], "undo": [...], "do_refs": [objects], "undo_refs": [objects]}.
+## Outside a batch it becomes its own undo action; inside one it is applied now and recorded.
+func _run_op(action_name: String, root: Node, op: Dictionary) -> void:
+	if _batch_open:
+		_batch_root_id = root.get_instance_id()
+		_batch_last_msec = Time.get_ticks_msec()
+		for c in op["do"]:
+			(c[0] as Object).callv(c[1], (c as Array).slice(2))
+		_batch_ops.append(op)
+		return
+	var ur := get_undo_redo()
+	ur.create_action(action_name, UndoRedo.MERGE_DISABLE, root)
+	_add_calls(ur, op["do"], true)
+	for ref in op["do_refs"]:
+		ur.add_do_reference(ref)
+	_add_calls(ur, op["undo"], false)
+	for ref in op["undo_refs"]:
+		ur.add_undo_reference(ref)
+	ur.commit_action()
+
+func _add_calls(ur: EditorUndoRedoManager, calls: Array, is_do: bool) -> void:
+	for c in calls:
+		var head: Array = [c[0], c[1]]
+		var rest: Array = (c as Array).slice(2)
+		if is_do:
+			ur.callv("add_do_method", head + rest)
+		else:
+			ur.callv("add_undo_method", head + rest)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -262,6 +355,8 @@ func _scene_error(args: Dictionary) -> String:
 	var root := EditorInterface.get_edited_scene_root()
 	if root == null:
 		return "no scene is open in the editor — use editor_open_scene first"
+	if _batch_open and _batch_root_id != 0 and root.get_instance_id() != _batch_root_id:
+		return "a batch (\"%s\") is open on another scene — call end_batch before switching scenes, so each undo step stays within one scene" % _batch_label
 	var wanted := _to_res_path(str(args.get("scene_path", "")))
 	if wanted != "" and wanted != root.scene_file_path:
 		return "'%s' is not the scene currently being edited (that is '%s') — use editor_open_scene first" % [wanted, root.scene_file_path]

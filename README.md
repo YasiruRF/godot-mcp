@@ -141,13 +141,15 @@ scene for you.
 To start a scene from scratch, use `create_scene` first (it won't overwrite an
 existing file unless you pass `overwrite: true`), then `add_node`.
 
-> **Editor open?** Godot keeps its own in-memory copy of an open scene, so
-> editing the file on disk underneath it makes the two diverge (and whichever
-> is saved last wins). When the bridge plugin is running, these on-disk tools
-> therefore **refuse to edit a scene that is open in the editor** and point you
-> to the [live-editing tools](#5-live-editing-watch-claude-work-in-the-editor)
-> (or to closing the scene's tab first). Without the plugin they can't tell, so
-> save and close the scene in Godot before asking Claude to edit it on disk.
+> **Editor open?** `add_node`, `set_node_properties` and `remove_node` route
+> themselves. If the bridge plugin is running and the scene is open in the
+> editor, the edit is made *live in the editor* (selected, undoable with Ctrl+Z)
+> instead of on disk, so the editor's copy and the file never diverge. If the
+> scene isn't open, or there is no editor, the `.tscn` is edited on disk. Every
+> result says which happened. (Without the plugin the server can't tell, so save
+> and close the scene in Godot before asking Claude to edit it on disk.)
+> `create_scene` with `overwrite` is the one exception: it refuses to replace a
+> scene that is open in the editor.
 
 ### 3. Read and edit scripts
 
@@ -228,6 +230,35 @@ The bridge is tested against **Godot 4.7.2**; it needs the `EditorInterface`
 singleton and `WebSocketPeer.accept_stream`, so Godot 4.2 or newer is the
 likely minimum. The sample project targets 4.3.
 
+### 6. Tasks: one undo step, a summary, and a boundary
+
+Wrap a multi-step change in a **task**:
+
+> **You:** Build a small obstacle course in `scenes/Main.tscn`, then tell me what you did.
+
+Claude calls `begin_task` (`label: "add obstacle course"`, optionally
+`paths: ["scenes/Main.tscn"]`), makes its edits, then `end_task`.
+
+- **One undo step.** While a task is open, live editor edits are recorded and
+  registered as a single entry in Godot's undo history, named
+  `Claude: add obstacle course`. One **Ctrl+Z** reverts the whole task. If the
+  client never calls `end_task`, the plugin closes the batch by itself after two
+  minutes without edits. A batch is tied to one scene; end it before switching.
+- **A summary in Godot words.** Each edit's result and `end_task` describe what
+  changed in node, property and script terms ("Added a `CollisionShape3D` named
+  `Shape` under `Player`…"), not as a diff. `get_change_summary` and the
+  `godot://changes` resource show it mid-task.
+- **Scope.** With `paths` (files, folders like `scenes/`, or globs like
+  `scripts/*.gd`) anything outside the working set is refused, and the refusal
+  says how to widen it: ask you, then `allow_paths`. Regardless of any task,
+  `project.godot`, `export_presets.cfg`, `.godot/`, `.git/` and `addons/` (which
+  includes this bridge) are refused unless a task names them, and a task that
+  changes more than 10 files (`GODOT_MCP_MAX_FILES`) must be approved to go
+  further. `end_task` lists the files touched and anything refused.
+
+Tasks are optional; the protections that don't need one (protected files, the
+file cap, `.gd`/shader-only script writes) apply anyway.
+
 ## Tool reference
 
 ### File tools (always available)
@@ -237,18 +268,24 @@ likely minimum. The sample project targets 4.3.
 | `list_project` | `project_path` | Lists scenes (`.tscn`), scripts (`.gd`) and resources (`.tres`/`.res`), as project-relative paths |
 | `read_scene` | `project_path`, `scene_path` | Parses a `.tscn` into a JSON list of nodes (`name`, `type`, `parent`, `path`, `instance`, `properties`) |
 | `create_scene` | `project_path`, `scene_path`, `root_name`, `root_type`, `overwrite?` | Creates a new scene with one root node |
-| `add_node` | `project_path`, `scene_path`, `parent_path`, `name`, `type`, `properties?`, `script_path?` | Adds a child node (use `"."` as the parent for the root) |
-| `remove_node` | `project_path`, `scene_path`, `node_path` | Removes a node, its descendants, and any signal connections pointing at them. The root can't be removed |
-| `set_node_properties` | `project_path`, `scene_path`, `node_path`, `properties` | Sets or overwrites raw properties on a node |
-| `write_script` | `project_path`, `script_path`, `content` | Creates or overwrites a script |
+| `add_node` | `project_path`, `scene_path`, `parent_path`, `name`, `type`, `properties?`, `script_path?` | Adds a child node (use `"."` as the parent for the root). Live in the editor if the scene is open there, otherwise on disk |
+| `remove_node` | `project_path`, `scene_path`, `node_path` | Removes a node and its descendants (on disk, also any signal connections pointing at them). The root can't be removed. Routes like `add_node` |
+| `set_node_properties` | `project_path`, `scene_path`, `node_path`, `properties` | Sets or overwrites properties on a node. Routes like `add_node` |
+| `write_script` | `project_path`, `script_path`, `content` | Creates or overwrites a `.gd` / `.gdshader` / `.gdshaderinc` file |
 | `read_script` | `project_path`, `script_path` | Reads a script |
 | `edit_script` | `project_path`, `script_path`, `old_text`, `new_text` | Replaces exactly one occurrence of `old_text` |
 | `run_headless` | `project_path`, `scene_path?`, `timeout_ms?` | Runs the project headlessly and returns its output and exit status |
+| `begin_task` | `label`, `paths?` | Starts a task: one undo step for live edits, a change log, an optional working set |
+| `end_task` | — | Ends the task; returns the summary, files touched and anything refused |
+| `allow_paths` | `paths` | Widens the working set **after the user agreed** |
+| `get_change_summary` | — | The plain-language summary so far (also the `godot://changes` resource) |
 
 Node names may not contain `. / : @ " %` or backslashes, and node types must be
 plain class names such as `Sprite2D` (both are Godot rules).
 
 ### Live editor bridge (needs the plugin enabled in a running editor)
+
+The `editor_add_node` / `editor_set_properties` / `editor_remove_node` tools still work but are superseded by the self-routing file tools above; keep them for explicit live-only edits.
 
 | Tool | Arguments | Purpose |
 |---|---|---|
@@ -307,11 +344,13 @@ change it there, change `GODOT_MCP_BRIDGE_URL` to match.
 | Plugin logs `failed to listen on 127.0.0.1:9080` | Another Godot editor (or program) already holds the port — close it |
 | `old_text matched N times; make it unique` | Add more surrounding lines to `old_text` in `edit_script` |
 | Edits don't show in the open editor | Godot caches open scenes; accept its "reload from disk" prompt |
-| `... is open in the Godot editor, so editing the file on disk would desync it` | Deliberate guard. Use `editor_add_node` / `editor_set_properties` / `editor_remove_node`, or close that scene's tab in Godot first |
+| `... is open in the Godot editor, so replacing the file on disk would desync it` | Only `create_scene` with `overwrite` hits this. Close that scene's tab in Godot first |
+| `... is off limits by default` / `outside this task's working set` / `already changed N files` | Scope guard. Ask the user, then `allow_paths` (see [Tasks](#6-tasks-one-undo-step-a-summary-and-a-boundary)) |
+| `The editor plugin is older than this server` (from `begin_task`) | Re-copy `addons/godot_mcp_bridge/` and toggle the plugin off and on to get one-undo-step batching |
 | `'...' is not the scene currently being edited` | Live edits act on the editor's active tab. Call `editor_open_scene` first |
 | `could not parse '...' as a Godot value` | Use Godot syntax: `Vector2(1, 2)`, `Color(1, 0, 0, 1)` (4 components), `true`, `42`, and text with quotes |
 | `... is GDScript, not scene-file syntax` | `RectangleShape2D.new()` only works in live edits (`editor_add_node`). In a scene file on disk, a resource must be a `SubResource(...)` |
-| `unknown command: add_node` (or another new command) | Your project has an older copy of the plugin. Re-copy `addons/godot_mcp_bridge/` and toggle the plugin off and on |
+| `unknown command: add_node` / `begin_batch` (or another new command) | Your project has an older copy of the plugin. Re-copy `addons/godot_mcp_bridge/` and toggle the plugin off and on |
 | Claude can't see the tools | Check the path in your MCP config is absolute and points at `dist/index.js`, that you ran `npm run build`, and restart the client |
 
 ## How it works
@@ -351,9 +390,16 @@ project splits into two independent halves:
   plugin is enabled. Those commands can change (undoably) and save the open
   scene. Enable the plugin while you use it, and never expose the port on a
   shared or public host.
-- Live edits act on the scene in the active editor tab, on nodes that belong
-  to it (not the internals of instanced sub-scenes). There is no MCP-side undo;
-  use Ctrl+Z in the editor.
+- Live edits act on the scene in the editor, on nodes that belong to it (not
+  the internals of instanced sub-scenes). There is no MCP-side undo; use Ctrl+Z
+  in the editor. When a self-routing tool targets an open scene that isn't the
+  active tab, it switches to that tab first.
+- Scope checks apply to the files the tools touch. They are a guard against
+  surprises, not a sandbox: they rely on the agent declaring a task, and
+  `allow_paths` is honoured on the agent's word that the user agreed.
+- Undo batching (`begin_task`) has unit tests on the server side only. The
+  GDScript that registers the batch has not been run in a real Godot editor
+  yet, and the 4.7.2 test run predates it.
 - Tested against Godot 4.7.2: the bridge plugin was run end to end in a real
   (headless) Godot editor, and `run_headless` with the real binary. Those runs
   are manual, not part of `npm test`, which uses stand-ins (a mock WebSocket
