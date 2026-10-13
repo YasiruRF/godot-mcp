@@ -310,6 +310,8 @@ unless that is the scene currently open. Values use Godot syntax (see
 |---|---|---|
 | `GODOT_BIN` | `godot4` | Godot 4 executable used by `run_headless` |
 | `GODOT_MCP_BRIDGE_URL` | `ws://127.0.0.1:9080` | Where the `editor_*` tools look for the bridge |
+| `GODOT_MCP_BRIDGE_TOKEN_FILE` | `~/.godot-mcp/bridge-token` | Where the server reads the bridge's token from |
+| `GODOT_MCP_MAX_FILES` | `10` | Files one task may change before it must be approved |
 
 Set them in your MCP client config, for example:
 
@@ -341,6 +343,7 @@ change it there, change `GODOT_MCP_BRIDGE_URL` to match.
 | `Could not launch "godot4": spawn godot4 ENOENT` | Godot isn't on `PATH` under that name. Set `GODOT_BIN` to the executable |
 | `run_headless` output is empty on Windows | Use the `_console.exe` Godot build |
 | `Could not reach the Godot editor bridge ... ECONNREFUSED` | Godot isn't open, or the plugin isn't enabled (Project Settings → Plugins). File tools still work without it |
+| `unauthorized: missing or wrong token` | The server and plugin disagree on the token. Re-copy the plugin and toggle it off and on (new plugins write the token file), and run the MCP server as the same user as Godot |
 | Plugin logs `failed to listen on 127.0.0.1:9080` | Another Godot editor (or program) already holds the port — close it |
 | `old_text matched N times; make it unique` | Add more surrounding lines to `old_text` in `edit_script` |
 | Edits don't show in the open editor | Godot caches open scenes; accept its "reload from disk" prompt |
@@ -384,12 +387,14 @@ project splits into two independent halves:
   database — run `run_headless` after edits.
 - `run_headless` and the live bridge need a local Godot install; the other
   tools don't.
-- The live bridge has no authentication. It binds to `127.0.0.1` only, but any
-  local program — and potentially a web page in your browser, since browsers
-  allow WebSocket connections to localhost — can send it commands while the
-  plugin is enabled. Those commands can change (undoably) and save the open
-  scene. Enable the plugin while you use it, and never expose the port on a
-  shared or public host.
+- The live bridge listens on `127.0.0.1` only and requires a random token. The
+  plugin writes it to `~/.godot-mcp/bridge-token` (owner-only permissions where
+  the OS supports it) each time it starts, and the server sends it with every
+  request, so a web page or another user's process can open the socket but is
+  refused. It does not stop a program running as *you*, which can read that file
+  (and could edit your project anyway). The bridge also refuses to set a node's
+  `script` property or create `Script` resources: scripts are attached only via
+  `script_path`, which loads an existing `res://` file.
 - Live edits act on the scene in the editor, on nodes that belong to it (not
   the internals of instanced sub-scenes). There is no MCP-side undo; use Ctrl+Z
   in the editor. When a self-routing tool targets an open scene that isn't the
@@ -403,7 +408,8 @@ project splits into two independent halves:
 - Tested against Godot 4.7.2: the bridge plugin was run end to end in a real
   (headless) Godot editor, and `run_headless` with the real binary. Those runs
   are manual, not part of `npm test`, which uses stand-ins (a mock WebSocket
-  server and a fake binary). Older Godot 4 versions are untested.
+  server and a fake binary). Older Godot 4 versions are untested. CI (`.github/workflows/ci.yml`) runs
+  `npm test` on Node 18, 20 and 22; it does not run Godot.
 
 ## Development
 

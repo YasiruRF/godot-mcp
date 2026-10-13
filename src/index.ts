@@ -442,7 +442,17 @@ server.tool(
       await assertProject(project_path);
       const godot = await findGodotBinary();
       const args = ["--headless", "--path", project_path];
-      if (scene_path) args.push(scene_path);
+      if (scene_path) {
+        // Resolve inside the project and pass a res:// path: a caller-supplied string such as
+        // "--script" must never reach Godot's argument list as a flag.
+        const full = await resolveInProject(project_path, scene_path);
+        if (![".tscn", ".scn"].includes(path.extname(full).toLowerCase())) {
+          throw new Error(`scene_path must be a .tscn or .scn scene, got "${scene_path}"`);
+        }
+        const exists = await fs.stat(full).then((st) => st.isFile()).catch(() => false);
+        if (!exists) throw new Error(`Scene not found: ${scene_path}`);
+        args.push(toResPath(project_path, full));
+      }
 
       const output = await new Promise<string>((resolve, reject) => {
         const child = spawn(godot, args, { timeout: timeout_ms });

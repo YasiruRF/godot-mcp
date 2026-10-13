@@ -453,3 +453,58 @@ test("file tools reject GDScript-only values like RectangleShape2D.new() instead
     assert.equal(fs.readFileSync(scenePath, "utf8"), before);
   });
 });
+
+test("run_headless never passes a caller-supplied string to Godot as a flag", async () => {
+  const argsFile = path.join(tmp, "args.json");
+  // a stand-in "Godot" that records the arguments it was started with
+  const fake = path.join(tmp, "fake-godot.mjs");
+  fs.writeFileSync(fake, `import fs from "node:fs"; fs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));`);
+  const launcher = process.platform === "win32" ? null : path.join(tmp, "fake-godot");
+  if (!launcher) return; // the stand-in needs a shebang launcher
+  fs.writeFileSync(launcher, `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`, { mode: 0o755 });
+
+  await withServer({ GODOT_BIN: launcher }, async (call) => {
+    for (const scene_path of ["--script", "--script=evil.gd", "-s", "--path=/etc", "../outside.tscn", "scripts/player.gd", "scenes/Missing.tscn"]) {
+      fs.rmSync(argsFile, { force: true });
+      const res = await call("run_headless", { project_path: proj, scene_path });
+      assert.equal(res.isError, true, scene_path);
+      assert.equal(fs.existsSync(argsFile), false, `Godot must not be launched for ${scene_path}`);
+    }
+    const ok = await call("run_headless", { project_path: proj, scene_path: "scenes/Main.tscn" });
+    assert.equal(ok.isError, false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(argsFile, "utf8")), ["--headless", "--path", proj, "res://scenes/Main.tscn"]);
+  });
+});
+
+test("every bridge request carries the shared token when the plugin has written one", async () => {
+  const tokenFile = path.join(tmp, "bridge-token");
+  fs.writeFileSync(tokenFile, "s3cret-token\n");
+  const withToken = (fn) => withMockBridgeEnv({ GODOT_MCP_BRIDGE_TOKEN_FILE: tokenFile }, fn);
+  await withToken(async (call, seen) => {
+    await call("editor_ping");
+    assert.equal(seen[0].token, "s3cret-token");
+  });
+  await withMockBridgeEnv({ GODOT_MCP_BRIDGE_TOKEN_FILE: path.join(tmp, "no-such-token") }, async (call, seen) => {
+    await call("editor_ping");
+    assert.equal(seen[0].token, undefined);
+  });
+});
+
+/** Like withMockBridge, with extra environment for the server. */
+async function withMockBridgeEnv(env, fn) {
+  const seen = [];
+  const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  await new Promise((resolve) => wss.on("listening", resolve));
+  wss.on("connection", (ws) =>
+    ws.on("message", (raw) => {
+      const msg = JSON.parse(raw.toString());
+      seen.push(msg);
+      ws.send(JSON.stringify({ id: msg.id, ok: true, result: { status: "alive" }, error: null }));
+    })
+  );
+  try {
+    await withServer({ GODOT_MCP_BRIDGE_URL: `ws://127.0.0.1:${wss.address().port}`, ...env }, (call) => fn(call, seen));
+  } finally {
+    wss.close();
+  }
+}

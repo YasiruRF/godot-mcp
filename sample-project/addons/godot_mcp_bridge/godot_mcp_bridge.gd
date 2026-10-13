@@ -19,6 +19,11 @@ const BAD_NAME_CHARS := ".:@/\"%"
 ## client that crashes mid-task can never leave the undo history open.
 const BATCH_IDLE_MSEC := 120000
 
+## Every request must carry the token written to ~/.godot-mcp/bridge-token when the plugin
+## starts. A web page or another user's process can open the socket but cannot read that file.
+var _token := ""
+var _token_file := ""
+
 var _tcp_server := TCPServer.new()
 var _peers: Array = []
 
@@ -32,6 +37,7 @@ var _batch_root_id := 0
 var _batch_last_msec := 0
 
 func _enter_tree() -> void:
+	_write_token()
 	var err := _tcp_server.listen(PORT, "127.0.0.1")
 	if err != OK:
 		push_warning("godot_mcp_bridge: failed to listen on 127.0.0.1:%d (error %d). Is another instance already running?" % [PORT, err])
@@ -44,6 +50,8 @@ func _exit_tree() -> void:
 		(p["ws"] as WebSocketPeer).close()
 	_peers.clear()
 	_tcp_server.stop()
+	if _token_file != "" and FileAccess.file_exists(_token_file):
+		DirAccess.remove_absolute(_token_file)
 
 func _process(_delta: float) -> void:
 	if _batch_open and Time.get_ticks_msec() - _batch_last_msec > BATCH_IDLE_MSEC:
@@ -70,6 +78,10 @@ func _handle_message(ws: WebSocketPeer, raw: String) -> void:
 	var data = JSON.parse_string(raw)
 	if typeof(data) != TYPE_DICTIONARY:
 		_reply(ws, null, _fail("invalid JSON message"))
+		return
+
+	if _token == "" or str(data.get("token", "")) != _token:
+		_reply(ws, data.get("id"), _fail("unauthorized: missing or wrong token (the godot-mcp server reads it from %s; restart the MCP server if you just restarted Godot)" % _token_file))
 		return
 
 	var args = data.get("args", {})
@@ -341,6 +353,29 @@ func _add_calls(ur: EditorUndoRedoManager, calls: Array, is_do: bool) -> void:
 			ur.callv("add_undo_method", head + rest)
 
 # ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+func _write_token() -> void:
+	_token = Crypto.new().generate_random_bytes(24).hex_encode()
+	var home := OS.get_environment("USERPROFILE") if OS.get_name() == "Windows" else OS.get_environment("HOME")
+	if home == "":
+		push_warning("godot_mcp_bridge: no home folder found, so no token can be shared; the bridge will refuse all requests")
+		_token = ""
+		return
+	var dir := home.path_join(".godot-mcp")
+	DirAccess.make_dir_recursive_absolute(dir)
+	_token_file = dir.path_join("bridge-token")
+	var f := FileAccess.open(_token_file, FileAccess.WRITE)
+	if f == null:
+		push_warning("godot_mcp_bridge: could not write %s (error %d); the bridge will refuse all requests" % [_token_file, FileAccess.get_open_error()])
+		_token = ""
+		return
+	f.store_string(_token)
+	f.close()
+	FileAccess.set_unix_permissions(_token_file, FileAccess.UNIX_READ_OWNER | FileAccess.UNIX_WRITE_OWNER)
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -363,9 +398,12 @@ func _scene_error(args: Dictionary) -> String:
 	return ""
 
 func _to_res_path(path: String) -> String:
-	if path == "" or path.begins_with("res://"):
+	if path == "":
 		return path
-	return "res://" + path.trim_prefix("/")
+	var res := path if path.begins_with("res://") else "res://" + path.trim_prefix("/")
+	if res.contains(".."):
+		return "res://__invalid_path__"  # never resolves to anything; keeps ".." out of load()
+	return res
 
 func _find_node(root: Node, path: String) -> Node:
 	if path == "." or path == "":
@@ -378,8 +416,13 @@ func _has_bad_chars(s: String) -> bool:
 			return true
 	return false
 
+## Properties that can't be set through the bridge: `script` would let a caller assign arbitrary
+## code, so scripts are attached only through `script_path`, which loads an existing res:// file.
+const FORBIDDEN_PROPERTIES := ["script"]
+
 func _has_property(node: Object, key: String) -> bool:
-	return key.split(":")[0] in node
+	var head := key.split(":")[0]
+	return (head in node) and not (head in FORBIDDEN_PROPERTIES)
 
 func _open_scenes() -> Array:
 	var scenes: Array = []
@@ -432,6 +475,8 @@ func _parse_value(text: String) -> Dictionary:
 		return {"value": null, "error": "Object(...) values are not allowed"}
 	if s.ends_with(".new()"):
 		var cls := s.trim_suffix(".new()")
+		if ClassDB.class_exists(cls) and ClassDB.is_parent_class(cls, "Script"):
+			return {"value": null, "error": "'%s' is a script class; attach scripts with script_path" % cls}
 		if ClassDB.class_exists(cls) and ClassDB.is_parent_class(cls, "Resource") and ClassDB.can_instantiate(cls):
 			return {"value": ClassDB.instantiate(cls), "error": ""}
 		return {"value": null, "error": "'%s' is not an instantiable Resource class" % cls}
